@@ -1,54 +1,64 @@
 'use strict'
+
 const _ = require('lodash')
 const Promise = require('bluebird')
-const EventEmitter = require('events')
-const Utils = require('./utils')
+const Matchers = require('./lib/matchers')
+const Utils = require('./lib/utils')
 const Catbox = require('catbox')
-const CatboxMemory = require('catbox-memory')
+const CatboxRethinkdb = require('catbox-rethinkdb')
 
-let externals = {}
+const r = require('rethinkdbdash')({
+  host: process.env.RETHINKDB_HOST || 'localhost',
+  port: process.env.RETHINKDB_PORT || 28015,
+  db: process.env.RETHINKDB_DB || 'flowxdb'
+})
 
-class flowEmitter extends EventEmitter { }
+const tableName = process.env.RETHINKDB_FLOWXTABLE || 'flowxtable'
 
+const catboxOptions = {
+  host: process.env.RETHINKDB_HOST || 'localhost',
+  port: process.env.RETHINKDB_PORT || 28015,
+  db: process.env.RETHINKDB_DB || 'flowxdb',
+  table: tableName
+}
+
+const client = new Catbox.Client(CatboxRethinkdb, catboxOptions)
+
+const externals = {}
 const INITIAL_STATE = 0
-
-const client = new Catbox.Client(CatboxMemory)
 
 module.exports.new = () => {
   return new Promise((resolve, reject) => {
-    client.start((err) => {
-      if (err) {
-        reject(err)
+    client.start((catboxError) => {
+      if (catboxError) {
+        reject(catboxError)
       }
 
-      externals.Instance = (function () {
-
-        function Instance(id, emitter, middlewares, initState) {
+      externals.Instance = class Instance {
+        constructor (id, middlewares, initState) {
           this.id = id
           this.currentState = initState
           this.middlewares = []
-          this.internalEmitter = emitter
           this.middlewares = middlewares
         }
+      }
 
-        return Instance
-      })()
-
-      externals.Flow = (function () {
-
-        function Flow(name, model) {
+      externals.Flow = class Flow {
+        constructor (name, model) {
           this.name = name
-          this.model = model
           this.instances = []
           this.middlewares = []
-          this.internalEmitter = new flowEmitter();
+          this.internalEmitter = {}
+
+          // Load globalTransitions and sort all transitions
+          this.model = Utils.prepareModel(model)
         }
 
-        Flow.prototype.newInstance = function (id) {
+        newInstance (id) {
           return new Promise((resolve, reject) => {
             const newState = _.cloneDeep(this.model.states[INITIAL_STATE])
-            const newInstance = new externals.Instance(id, this.internalEmitter, this.middlewares, newState)
-            console.log('CREANDO NUEVA INSTANCIA ' + JSON.stringify(newInstance))
+            const newInstance = new externals.Instance(id, this.middlewares, newState)
+            console.log(`Creating new instance ${JSON.stringify(newInstance)}`)
             client.set(id, newInstance, this.model.ttl, (err) => {
               if (err) {
                 reject(err)
@@ -58,7 +68,7 @@ module.exports.new = () => {
           })
         }
 
-        Flow.prototype.addInstance = function (instance) {
+        addInstance (instance) {
           return new Promise((resolve, reject) => {
             client.set(instance.id, instance, this.model.ttl, (err) => {
               if (err) {
@@ -69,24 +79,24 @@ module.exports.new = () => {
           })
         }
 
-        Flow.prototype.getInstance = function (id) {
+        getInstance (id) {
           return new Promise((resolve, reject) => {
             client.get(id, (err, cached) => {
               if (err || !cached) {
                 this.newInstance(id).then((newInstance) => {
                   resolve(newInstance)
-                }).catch((err) => {
-                  reject(err)
+                }).catch((newInstanceError) => {
+                  reject(newInstanceError)
                 })
               } else {
-                console.log('Instance found ' + JSON.stringify(cached.item))
+                console.log(`Instance found: ${JSON.stringify(cached.item)}`)
                 resolve(cached.item)
               }
             })
           })
         }
 
-        Flow.prototype.searchNextState = function (stateName, global) {
+        searchNextState (stateName, global) {
           return new Promise((resolve, reject) => {
             for (var i = 0; i < this.model.states.length; i++) {
               if (this.model.states[i].name === stateName && (global === false || this.model.states[i].global)) {
@@ -94,81 +104,87 @@ module.exports.new = () => {
                 return resolve(newState)
               }
             }
-            return reject(new Error(`State ${stateName} not found!`))
+            return reject(new Error(`State: ${stateName} => not found!`))
           })
         }
 
-        Flow.prototype.validateTransition = function (instance, transitionName) {
+        validateTransition (instance, action) {
           return new Promise((resolve, reject) => {
             if (instance.currentState.transitions) {
               for (var i = 0; i < instance.currentState.transitions.length; i++) {
-                if (Utils.matchRule(instance.currentState.transitions[i].when, transitionName) || Utils.matchRegExp(instance.currentState.transitions[i].when, transitionName)) {
+                if (Array.isArray(action) && Matchers.matchList(instance.currentState.transitions[i], action)) {
+                  return resolve(instance.currentState.transitions[i])
+                } else if (Matchers.matchOne(instance.currentState.transitions[i].when, action)) {
                   return resolve(instance.currentState.transitions[i])
                 }
               }
-              console.log('No se pudo encontrar el estado en las transiciones')
-              return resolve(transitionName)
+              console.log(`Transition not found, searching for global state: ${action}`)
+              return resolve(action)
             } else {
-              console.log('No se pudo encontrar ninguna transición')
-              return resolve(transitionName)
+              console.log(`Transitions not found, searching for global state: ${action}`)
+              return resolve(action)
             }
           })
         }
 
-        Flow.prototype.getState = function (instance, data) {
+        getState (instance, data) {
+          const updatedInstance = _.cloneDeep(instance)
           return new Promise((resolve, reject) => {
             if (data && data.action) {
-              this.validateTransition(instance, data.action).then((transition) => {
+              this.validateTransition(updatedInstance, data.action).then((transition) => {
                 this.searchNextState(transition.to || transition, transition.to === undefined).then((nextState) => {
                   if (transition.use) {
-                    instance.middlewares[transition.use](instance.currentState, (data) => {
-                      instance.currentState = nextState
+                    updatedInstance.middlewares[transition.use](updatedInstance.currentState, (data) => {
+                      updatedInstance.currentState = nextState
 
-                      client.set(instance.id, instance, this.model.ttl, (err) => {
+                      client.set(updatedInstance.id, updatedInstance, this.model.ttl, (err) => {
                         if (err) {
-                          reject(err)
+                          return reject(err)
                         }
-                        if (instance.currentState.onEnter) {
-                          if (instance.currentState.onEnter.emit) {
-                            instance.internalEmitter.emit(instance.currentState.onEnter.emit, instance.currentState.onEnter.data)
+                        if (updatedInstance.currentState.onEnter) {
+                          if (updatedInstance.currentState.onEnter.emit) {
+                            this.internalEmitter.emit(updatedInstance.currentState.onEnter.emit, updatedInstance.currentState.onEnter.data)
                           }
                         }
-                        resolve(instance.currentState)
+                        return resolve(updatedInstance.currentState)
                       })
                     })
                   } else {
-                    instance.currentState = nextState
-                    client.set(instance.id, instance, this.model.ttl, (err) => {
-                      console.log('New state: ' + JSON.stringify(instance))
+                    updatedInstance.currentState = nextState
+                    client.set(updatedInstance.id, updatedInstance, this.model.ttl, (err) => {
+                      console.log(`New state: ${JSON.stringify(updatedInstance)}`)
                       if (err) {
-                        reject(err)
+                        return reject(err)
                       }
-                      if (instance.currentState.onEnter) {
-                        if (instance.currentState.onEnter.emit) {
-                          instance.internalEmitter.emit(instance.currentState.onEnter.emit, instance.currentState.onEnter.data)
+                      if (updatedInstance.currentState.onEnter) {
+                        if (updatedInstance.currentState.onEnter.emit) {
+                          this.internalEmitter.emit(updatedInstance.currentState.onEnter.emit, updatedInstance.currentState.onEnter.data)
                         }
                       }
-                      resolve(instance.currentState)
+                      return resolve(updatedInstance.currentState)
                     })
-
                   }
                 }).catch((err) => {
-                  this.goToDefault(instance).then((state) => {
+                  this.goToDefault(updatedInstance).then((state) => {
                     return resolve(state)
+                  }).catch((err) => {
+                    return reject(err)
                   })
                 })
               }).catch((err) => {
-                this.goToDefault(instance).then((state) => {
+                this.goToDefault(updatedInstance).then((state) => {
                   return resolve(state)
+                }).catch((err) => {
+                  return reject(err)
                 })
               })
             } else {
-              return resolve(instance.currentState)
+              return resolve(updatedInstance.currentState)
             }
           })
         }
 
-        Flow.prototype.goToDefault = function (instance) {
+        goToDefault (instance) {
           return new Promise((resolve, reject) => {
             this.searchNextState('default', false).then((nextState) => {
               instance.currentState = nextState
@@ -178,7 +194,7 @@ module.exports.new = () => {
                 }
                 if (instance.currentState.onEnter) {
                   if (instance.currentState.onEnter.emit) {
-                    instance.internalEmitter.emit(instance.currentState.onEnter.emit, instance.currentState.onEnter.data)
+                    this.internalEmitter.emit(instance.currentState.onEnter.emit, instance.currentState.onEnter.data)
                   }
                 }
                 resolve(instance.currentState)
@@ -189,7 +205,7 @@ module.exports.new = () => {
           })
         }
 
-        Flow.prototype.saveInstance = function (instance) {
+        saveInstance (instance) {
           return new Promise((resolve, reject) => {
             client.set(instance.id, instance, this.model.ttl, (err) => {
               if (err) {
@@ -200,20 +216,41 @@ module.exports.new = () => {
           })
         }
 
-        Flow.prototype.on = function (eventName, eventFunction) {
+        on (eventName, eventFunction) {
           this.internalEmitter.on(eventName, eventFunction)
         }
 
-        Flow.prototype.register = function (name, fn) {
+        register (name, fn) {
           this.middlewares[name] = fn
         }
 
-        return Flow
+        getInstancesBySegment (segment) {
+          return new Promise((resolve, reject) => {
+            r.table(tableName).filter({
+              value: {
+                id: {
+                  segment: segment
+                }
+              }
+            }).run().then(instances => {
+              return resolve(instances)
+            }).catch(error => {
+              return reject(error)
+            })
+          })
+        }
 
-      })()
-
+        findInstances (filter) {
+          return new Promise((resolve, reject) => {
+            r.table(tableName).filter(filter).run().then(instances => {
+              return resolve(instances)
+            }).catch(error => {
+              return reject(error)
+            })
+          })
+        }
+      }
       resolve(externals)
-
     })
   })
 }
